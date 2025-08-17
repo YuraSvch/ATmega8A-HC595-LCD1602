@@ -7,7 +7,7 @@
    MOSI=PB3 - SER(14) 74HC595
    SCK =PB5 - SHCP(11)
    SS  =PB2 - STCP(12) (Latch)
-   74HC595: OE(13)?GND, MR(10)?VCC, VCC(16)=+5V, GND(8)=GND
+   74HC595: OE(13) - GND, MR(10) - VCC, VCC(16) - +5V, GND(8) - GND
    LCD: RW - GND, V0 через потенціометр
 */
 
