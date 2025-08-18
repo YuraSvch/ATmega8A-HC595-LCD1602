@@ -3,109 +3,106 @@
 #include <util/delay.h>
 #include <stdint.h>
 
-/* ===== ATmega8A SPI pins =====
-   MOSI=PB3 - SER(14) 74HC595
-   SCK =PB5 - SHCP(11)
-   SS  =PB2 - STCP(12) (Latch)
-   74HC595: OE(13) - GND, MR(10) - VCC, VCC(16) - +5V, GND(8) - GND
-   LCD: RW - GND, V0 через потенціометр
-*/
+#define LATCH_PIN PB2
 
-#define SPI_PORT PORTB
-#define SPI_DDR  DDRB
-#define SPI_MOSI PB3
-#define SPI_SCK  PB5
-#define SPI_LCH  PB2   // STCP / Latch
+// Біти виходу 74HC595
+#define Q_RS 0
+#define Q_E  1
+#define Q_D4 2
+#define Q_D5 3
+#define Q_D6 4
+#define Q_D7 5
 
-/* ===== LCD ? 74HC595 mapping =====
-   RS=Q0, E=Q1, D4..D7=Q2..Q5
-*/
-#define LCD_RS_Q 0
-#define LCD_E_Q  1
-#define LCD_D4_Q 2
-#define LCD_D5_Q 3
-#define LCD_D6_Q 4
-#define LCD_D7_Q 5
-#define LCD_DATA_MASK ((1u<<LCD_D4_Q)|(1u<<LCD_D5_Q)|(1u<<LCD_D6_Q)|(1u<<LCD_D7_Q))
+static inline void spi_init(void) {
+    // PB2(SS), PB3(MOSI), PB5(SCK) - виходи; PB4(MISO) - вхід
+    DDRB |= (1<<LATCH_PIN) | (1<<PB3) | (1<<PB5);
+    DDRB &= ~(1<<PB4);
 
-static volatile uint8_t BUS = 0;
+    // Початковий стан SS=0
+    PORTB &= ~(1<<LATCH_PIN);
 
-static inline void spi_init(void){
-    SPI_DDR |= (1<<SPI_MOSI) | (1<<SPI_SCK) | (1<<SPI_LCH); // виходи
-    SPI_PORT |= (1<<SPI_LCH);                               // LATCH=1
-    // SPI: Enable, Master, Mode0, MSB-first, SCK=F_CPU/64
-    SPCR = (1<<SPE) | (1<<MSTR) | (1<<SPR1);
+    SPCR = (1<<SPE) | (1<<MSTR) | (1<<SPR1);   // SPR1=1, SPR0=0 -> /64
     SPSR = 0;
 }
 
-/* Лачимо ЗАВЖДИ після повної передачі байта (виходи змінюються атомарно) */
-static inline void sh595_apply(void){
-    uint8_t val = BUS & ~( (1u<<6) | (1u<<7) );   // Q6,Q7 завжди 0 (незадіяні)
-    SPI_PORT &= ~(1<<SPI_LCH);                    // LATCH=0 (не оновлювати під час зсуву)
-    SPDR = val;                                   // MSB-first ? біт i лягає у Qi
-    while(!(SPSR & (1<<SPIF))){}
-    SPI_PORT |= (1<<SPI_LCH);                     // LATCH=1 (оновити виходи разом)
+static inline void shift595_write(uint8_t v) {
+    //SS низький під час зсуву
+    PORTB &= ~(1<<LATCH_PIN);
+    SPDR = v;
+    while(!(SPSR & (1<<SPIF)));
+    // Копіювання у вихідні тригери по фронту STCP
+    PORTB |=  (1<<LATCH_PIN);
+    _delay_us(1);
+    PORTB &= ~(1<<LATCH_PIN);
 }
 
-static inline void lcd_pulse_E(void){
-    BUS |=  (1u<<LCD_E_Q); sh595_apply(); _delay_us(1);  // E=1
-    BUS &= ~(1u<<LCD_E_Q); sh595_apply(); _delay_us(40); // E=0 + пауза між ніблів
+// Збираємо байт для 74HC595: RS, E, D4..D7
+static inline uint8_t pack_595(uint8_t rs, uint8_t e, uint8_t nibble4) {
+    // nibble4: молодші 4 біти -> на Q2..Q5
+    uint8_t v = 0;
+    v |= (rs & 1) << Q_RS;
+    v |= (e  & 1) << Q_E;
+    v |= (nibble4 & 0x0F) << Q_D4; // Q2..Q5
+    return v;
 }
 
-/* RS ? дані D4..D7 ? імпульс E */
-static inline void lcd_write_nibble(uint8_t nib, uint8_t rs){
-    if(rs) BUS |=  (1u<<LCD_RS_Q);
-    else   BUS &= ~(1u<<LCD_RS_Q);
-
-    BUS &= ~LCD_DATA_MASK;                 // очистити D4..D7
-    if(nib & 0x01) BUS |= (1u<<LCD_D4_Q);  // b0 -> D4
-    if(nib & 0x02) BUS |= (1u<<LCD_D5_Q);  // b1 -> D5
-    if(nib & 0x04) BUS |= (1u<<LCD_D6_Q);  // b2 -> D6
-    if(nib & 0x08) BUS |= (1u<<LCD_D7_Q);  // b3 -> D7
-
-    sh595_apply();           // дані стабільні при E=0
-    _delay_us(1);            // t_AS
-    lcd_pulse_E();           // захопити нібл
+static inline void lcd_write4(uint8_t rs, uint8_t nibble) {
+    // E=0: виставляємо дані й RS
+    shift595_write(pack_595(rs, 0, nibble));
+    // Строб E: 1 -> 0
+    shift595_write(pack_595(rs, 1, nibble));
+    _delay_us(1);  // ширина імпульсу E
+    shift595_write(pack_595(rs, 0, nibble));
+    _delay_us(40); // час виконання коротких інструкцій/запису даних
 }
 
-static inline void lcd_cmd(uint8_t c){
-    lcd_write_nibble(c>>4, 0);
-    lcd_write_nibble(c&0x0F, 0);
-    if(c==0x01 || c==0x02) _delay_ms(2);   // довгі команди
-}
-static inline void lcd_data(uint8_t d){
-    lcd_write_nibble(d>>4, 1);
-    lcd_write_nibble(d&0x0F, 1);
-}
-static inline void lcd_goto(uint8_t x, uint8_t y){
-    lcd_cmd((y?0xC0:0x80)+x);
+static inline void lcd_cmd(uint8_t cmd) {
+    lcd_write4(0, (cmd >> 4) & 0x0F);
+    lcd_write4(0,  cmd       & 0x0F);
+
+    if (cmd == 0x01 || cmd == 0x02) {
+        _delay_ms(2);
+    }
 }
 
-static inline void lcd_init(void){
+static inline void lcd_data(uint8_t data) {
+    lcd_write4(1, (data >> 4) & 0x0F);
+    lcd_write4(1,  data       & 0x0F);
+}
+
+static void lcd_init(void) {
+    _delay_ms(20); 
+
+    // Початкові 8-бітні "пінги" (лише старший нібл)
+    lcd_write4(0, 0x03); _delay_ms(5);
+    lcd_write4(0, 0x03); _delay_us(150);
+    lcd_write4(0, 0x03); _delay_us(150);
+
+    // Перехід у 4-бітний режим
+    lcd_write4(0, 0x02); _delay_us(150);
+
+    // Набір функцій: 4-біти, 2 лінії, 5x8
+    lcd_cmd(0x28);
+    // Дисплей вимкнено
+    lcd_cmd(0x08);
+    // Очищення
+    lcd_cmd(0x01);
+    lcd_cmd(0x06);
+    // Дисплей увімкнено, курсор вимкнено, блимання вимкнено
+    lcd_cmd(0x0C);
+}
+
+int main(void) {
     spi_init();
-    BUS = 0; sh595_apply();
-    _delay_ms(50);
-
-    // Вхід у 4-бітний: верхні ніблі 0x3,0x3,0x3,0x2 (з запасом по паузах)
-    lcd_write_nibble(0x03,0); _delay_ms(5);
-    lcd_write_nibble(0x03,0); _delay_us(150);
-    lcd_write_nibble(0x03,0); _delay_us(150);
-    lcd_write_nibble(0x02,0); _delay_us(150);
-
-    // База
-    lcd_cmd(0x28);  // 4-біт, 2 рядки, 5x8
-    lcd_cmd(0x0C);  // дисплей ON, курсор OFF
-    lcd_cmd(0x06);  // автоінкремент
-    lcd_cmd(0x01);  // очистка
-    _delay_ms(2);
-}
-
-int main(void){
     lcd_init();
 
-    lcd_goto(0,0);
-    const char *s = "Hello Volodymyr";
-    while(*s) lcd_data((uint8_t)*s++);
+    // Виводимо "Hello" у (0,0)
+    const char *s = "Hello";
+    while (*s) {
+        lcd_data((uint8_t)*s++);
+    }
 
-    while(1){}
+    while (1) {
+        // Залишаємо(безкінечно оновлюємо) напис
+    }
 }
